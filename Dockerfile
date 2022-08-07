@@ -1,7 +1,12 @@
-# hadolint ignore=DL3007
 FROM myoung34/github-runner-base:latest
+
 LABEL maintainer="myoung34@my.apsu.edu"
 
+RUN  apt-get update
+RUN apt-get install -y git-all
+RUN curl -s https://packagecloud.io/install/repositories/github/git-lfs/script.deb.sh | sudo bash
+RUN sudo apt-get install git-lfs
+RUN sudo git lfs install --system
 ENV AGENT_TOOLSDIRECTORY=/opt/hostedtoolcache
 RUN mkdir -p /opt/hostedtoolcache
 
