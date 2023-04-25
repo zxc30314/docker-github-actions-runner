@@ -1,12 +1,15 @@
 #!/usr/bin/dumb-init /bin/bash
+# shellcheck shell=bash
 
 export RUNNER_ALLOW_RUNASROOT=1
-export PATH=$PATH:/actions-runner
+export PATH=${PATH}:/actions-runner
 
 # Un-export these, so that they must be passed explicitly to the environment of
 # any command that needs them.  This may help prevent leaks.
 export -n ACCESS_TOKEN
 export -n RUNNER_TOKEN
+export -n APP_ID
+export -n APP_PRIVATE_KEY
 
 deregister_runner() {
   echo "Caught SIGTERM. Deregistering runner"
@@ -20,15 +23,32 @@ deregister_runner() {
 
 _DISABLE_AUTOMATIC_DEREGISTRATION=${DISABLE_AUTOMATIC_DEREGISTRATION:-false}
 
+_RANDOM_RUNNER_SUFFIX=${RANDOM_RUNNER_SUFFIX:="true"}
+
 _RUNNER_NAME=${RUNNER_NAME:-${RUNNER_NAME_PREFIX:-github-runner}-$(head /dev/urandom | tr -dc A-Za-z0-9 | head -c 13 ; echo '')}
-_RUNNER_WORKDIR=${RUNNER_WORKDIR:-/_work}
+if [[ ${RANDOM_RUNNER_SUFFIX} != "true" ]]; then
+  # In some cases this file does not exist
+  if [[ -f "/etc/hostname" ]]; then
+    # in some cases it can also be empty
+    if [[ $(stat --printf="%s" /etc/hostname) -ne 0 ]]; then
+      _RUNNER_NAME=${RUNNER_NAME:-${RUNNER_NAME_PREFIX:-github-runner}-$(cat /etc/hostname)}
+      echo "RANDOM_RUNNER_SUFFIX is ${RANDOM_RUNNER_SUFFIX}. /etc/hostname exists and has content. Setting runner name to ${_RUNNER_NAME}"
+    else
+      echo "RANDOM_RUNNER_SUFFIX is ${RANDOM_RUNNER_SUFFIX} ./etc/hostname exists but is empty. Not using /etc/hostname."
+    fi
+  else
+    echo "RANDOM_RUNNER_SUFFIX is ${RANDOM_RUNNER_SUFFIX} but /etc/hostname does not exist. Not using /etc/hostname."
+  fi
+fi
+
+_RUNNER_WORKDIR=${RUNNER_WORKDIR:-/_work/${_RUNNER_NAME}}
 _LABELS=${LABELS:-default}
 _RUNNER_GROUP=${RUNNER_GROUP:-Default}
 _GITHUB_HOST=${GITHUB_HOST:="github.com"}
 _RUN_AS_ROOT=${RUN_AS_ROOT:="true"}
 
 # ensure backwards compatibility
-if [[ -z $RUNNER_SCOPE ]]; then
+if [[ -z ${RUNNER_SCOPE} ]]; then
   if [[ ${ORG_RUNNER} == "true" ]]; then
     echo 'ORG_RUNNER is now deprecated. Please use RUNNER_SCOPE="org" instead.'
     export RUNNER_SCOPE="org"
@@ -44,6 +64,9 @@ case ${RUNNER_SCOPE} in
     [[ -z ${ORG_NAME} ]] && ( echo "ORG_NAME required for org runners"; exit 1 )
     _SHORT_URL="https://${_GITHUB_HOST}/${ORG_NAME}"
     RUNNER_SCOPE="org"
+    if [[ -n "${APP_ID}" ]] && [[ -z "${APP_LOGIN}" ]]; then
+      APP_LOGIN=${ORG_NAME}
+    fi
     ;;
 
   ent*)
@@ -56,28 +79,44 @@ case ${RUNNER_SCOPE} in
     [[ -z ${REPO_URL} ]] && ( echo "REPO_URL required for repo runners"; exit 1 )
     _SHORT_URL=${REPO_URL}
     RUNNER_SCOPE="repo"
+    if [[ -n "${APP_ID}" ]] && [[ -z "${APP_LOGIN}" ]]; then
+      APP_LOGIN=${REPO_URL%/*}
+      APP_LOGIN=${APP_LOGIN##*/}
+    fi
     ;;
 esac
 
 configure_runner() {
+  ARGS=()
+  if [[ -n "${APP_ID}" ]] && [[ -n "${APP_PRIVATE_KEY}" ]] && [[ -n "${APP_LOGIN}" ]]; then
+    if [[ -n "${ACCESS_TOKEN}" ]] || [[ -n "${RUNNER_TOKEN}" ]]; then
+      echo "ERROR: ACCESS_TOKEN or RUNNER_TOKEN provided but are mutually exclusive with APP_ID, APP_PRIVATE_KEY and APP_LOGIN." >&2
+      exit 1
+    fi
+    echo "Obtaining access token for app_id ${APP_ID} and login ${APP_LOGIN}"
+    nl="
+"
+    ACCESS_TOKEN=$(APP_ID="${APP_ID}" APP_PRIVATE_KEY="${APP_PRIVATE_KEY//\\n/${nl}}" APP_LOGIN="${APP_LOGIN}" bash /app_token.sh)
+  elif [[ -n "${APP_ID}" ]] || [[ -n "${APP_PRIVATE_KEY}" ]] || [[ -n "${APP_LOGIN}" ]]; then
+    echo "ERROR: All of APP_ID, APP_PRIVATE_KEY and APP_LOGIN must be specified." >&2
+    exit 1
+  fi
+
   if [[ -n "${ACCESS_TOKEN}" ]]; then
     echo "Obtaining the token of the runner"
     _TOKEN=$(ACCESS_TOKEN="${ACCESS_TOKEN}" bash /token.sh)
     RUNNER_TOKEN=$(echo "${_TOKEN}" | jq -r .token)
   fi
 
+  # shellcheck disable=SC2153
   if [ -n "${EPHEMERAL}" ]; then
     echo "Ephemeral option is enabled"
-    _EPHEMERAL="--ephemeral"
-  else
-    _EPHEMERAL=""
+    ARGS+=("--ephemeral")
   fi
 
   if [ -n "${DISABLE_AUTO_UPDATE}" ]; then
     echo "Disable auto update option is enabled"
-    _AUTO_UPDATE="--disableupdate"
-  else
-    _AUTO_UPDATE=""
+    ARGS+=("--disableupdate")
   fi
 
   echo "Configuring"
@@ -90,12 +129,10 @@ configure_runner() {
       --runnergroup "${_RUNNER_GROUP}" \
       --unattended \
       --replace \
-      ${_EPHEMERAL} \
-      ${_AUTO_UPDATE}
+      "${ARGS[@]}"
 
   [[ ! -d "${_RUNNER_WORKDIR}" ]] && mkdir "${_RUNNER_WORKDIR}"
-  
-  [[ $(id -u) -eq 0 ]] && /usr/bin/chown -R runner ${_RUNNER_WORKDIR} /opt/hostedtoolcache/ /actions-runner || :
+
 }
 
 
@@ -133,7 +170,20 @@ fi
 
 
 if [[ ${_RUN_AS_ROOT} == "true" ]]; then
-  [[ $(id -u) -eq 0 ]] && ( "$@" ) || ( echo "ERROR: RUN_AS_ROOT env var is set to true but the user has been overriden and is not running as root"; exit 1 )
+  if [[ $(id -u) -eq 0 ]]; then
+    "$@"
+  else
+    echo "ERROR: RUN_AS_ROOT env var is set to true but the user has been overridden and is not running as root, but UID '$(id -u)'"
+    exit 1
+  fi
 else
-  [[ $(id -u) -eq 0 ]] && ( /usr/sbin/gosu runner "$@" ) || ( "$@" )
+  if [[ $(id -u) -eq 0 ]]; then
+    [[ -n "${CONFIGURED_ACTIONS_RUNNER_FILES_DIR}" ]] && /usr/bin/chown -R runner "${CONFIGURED_ACTIONS_RUNNER_FILES_DIR}"
+    /usr/bin/chown -R runner "${_RUNNER_WORKDIR}" /actions-runner
+    # The toolcache is not recursively chowned to avoid recursing over prepulated tooling in derived docker images
+    /usr/bin/chown runner /opt/hostedtoolcache/
+    /usr/sbin/gosu runner "$@"
+  else
+    "$@"
+  fi
 fi
