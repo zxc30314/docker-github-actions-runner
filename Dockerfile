@@ -1,7 +1,6 @@
+# hadolint ignore=DL3007
 FROM myoung34/github-runner-base:latest
-
 LABEL maintainer="myoung34@my.apsu.edu"
-
 RUN apt-get update
 RUN apt-get install -y git-all
 RUN curl -s https://packagecloud.io/install/repositories/github/git-lfs/script.deb.sh | sudo bash
@@ -9,7 +8,6 @@ RUN apt-get install git-lfs
 RUN git lfs install --system
 RUN wget https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
 RUN apt install -y ./google-chrome-stable_current_amd64.deb
-
 ENV AGENT_TOOLSDIRECTORY=/opt/hostedtoolcache
 RUN mkdir -p /opt/hostedtoolcache
 
